@@ -71,6 +71,8 @@ typedef struct _VIOSOCK_SELECT_PKT
     PVIRTIO_VSOCK_SELECT pSelect;
     ULONG FdCount[FDSET_MAX];
     NTSTATUS Status;
+    volatile ULONG Cancelled; // set by VIOSockSelectCancel once it is done with the request
+    ULONG CancelPending;      // work item only: unmarked as cancelled, VIOSockSelectCancel still to run
     VIOSOCK_SELECT_HANDLE Fds[FD_SETSIZE];
 } VIOSOCK_SELECT_PKT, *PVIOSOCK_SELECT_PKT;
 
@@ -770,6 +772,9 @@ static VOID VIOSockSelectCancel(IN WDFREQUEST Request)
 
     TraceEvents(TRACE_LEVEL_VERBOSE, DBG_SELECT, "--> %s\n", __FUNCTION__);
 
+    // VIOSockSelectWorkitem completes the request once Cancelled is set, so the
+    // request must not be touched after this.
+    GetSelectContext(Request)->Cancelled = TRUE;
     VIOSockSelectEnqueueWorkItem(pContext);
 }
 
@@ -802,36 +807,55 @@ static VOID VIOSockSelectWorkitem(IN WDFWORKITEM Workitem)
         {
             PVIOSOCK_SELECT_PKT pPkt = CONTAINING_RECORD(CurrentItem, VIOSOCK_SELECT_PKT, ListEntry);
             WDFREQUEST Request = WdfObjectContextGetObject(pPkt);
-            NTSTATUS status = WdfRequestUnmarkCancelable(Request);
-
-            ASSERT(NT_SUCCESS(status) || status == STATUS_CANCELLED);
+            NTSTATUS status;
 
             bRemove = FALSE;
 
-            if (status == STATUS_CANCELLED)
+            if (pPkt->Cancelled)
             {
+                // VIOSockSelectCancel is done with the request: complete it here
                 bRemove = TRUE;
                 pPkt->Status = STATUS_CANCELLED;
             }
-            else if (VIOSockSelectCheckPkt(pPkt))
+            else if (pPkt->CancelPending)
             {
-                bRemove = TRUE;
-                pPkt->Status = STATUS_SUCCESS;
+                // already unmarked as cancelled, VIOSockSelectCancel has not run yet
+                continue;
             }
-            else if (pPkt->Timeout)
+            else
             {
-                if (pPkt->Timeout <= TimePassed + VIOSOCK_TIMER_TOLERANCE)
+                status = WdfRequestUnmarkCancelable(Request);
+
+                ASSERT(NT_SUCCESS(status) || status == STATUS_CANCELLED);
+
+                if (status == STATUS_CANCELLED)
+                {
+                    // VIOSockSelectCancel is about to run and must find the request
+                    // alive: keep it on SelectList until the callback sets Cancelled
+                    pPkt->CancelPending = TRUE;
+                    continue;
+                }
+
+                if (VIOSockSelectCheckPkt(pPkt))
                 {
                     bRemove = TRUE;
-                    pPkt->Status = STATUS_IO_TIMEOUT;
+                    pPkt->Status = STATUS_SUCCESS;
                 }
-                else
+                else if (pPkt->Timeout)
                 {
-                    pPkt->Timeout -= TimePassed;
-
-                    if (pPkt->Timeout < Timeout)
+                    if (pPkt->Timeout <= TimePassed + VIOSOCK_TIMER_TOLERANCE)
                     {
-                        Timeout = pPkt->Timeout;
+                        bRemove = TRUE;
+                        pPkt->Status = STATUS_IO_TIMEOUT;
+                    }
+                    else
+                    {
+                        pPkt->Timeout -= TimePassed;
+
+                        if (pPkt->Timeout < Timeout)
+                        {
+                            Timeout = pPkt->Timeout;
+                        }
                     }
                 }
             }
